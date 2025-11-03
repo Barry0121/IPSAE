@@ -153,7 +153,7 @@ def parse_pdb_atom_line(line):
 
 def parse_cif_atom_line(line,fielddict):
     # for parsing AF3 and Boltz1 mmCIF files
-    # ligands do not have residue numbers but modified residues do. Return "None" for ligand.
+    # ligands do not have residue numbers but modified residues do. Return ligand atoms with is_ligand flag.
     # AF3 mmcif lines
     # 0      1   2   3     4  5  6 7  8  9  10      11     12      13   14    15 16 17
     #ATOM   1294 N   N     . ARG A 1 159 ? 5.141   -14.096 10.526  1.00 95.62 159 A 1
@@ -166,12 +166,12 @@ def parse_cif_atom_line(line,fielddict):
     #HETATM 1307 C   C     . TPO A 1 160 ? -2.115  -11.668 12.263  1.00 96.19 160 A 1
     #HETATM 1308 O   O     . TPO A 1 160 ? -1.790  -11.556 11.113  1.00 95.75 160 A 1
     # ...
-    #HETATM 2608 P   PG    . ATP C 3 .   ? -6.858  4.182   10.275  1.00 84.94 1   C 1 
-    #HETATM 2609 O   O1G   . ATP C 3 .   ? -6.178  5.238   11.074  1.00 75.56 1   C 1 
-    #HETATM 2610 O   O2G   . ATP C 3 .   ? -5.889  3.166   9.748   1.00 75.15 1   C 1 
+    #HETATM 2608 P   PG    . ATP C 3 .   ? -6.858  4.182   10.275  1.00 84.94 1   C 1
+    #HETATM 2609 O   O1G   . ATP C 3 .   ? -6.178  5.238   11.074  1.00 75.56 1   C 1
+    #HETATM 2610 O   O2G   . ATP C 3 .   ? -5.889  3.166   9.748   1.00 75.15 1   C 1
     # ...
-    #HETATM 2639 MG  MG    . MG  D 4 .   ? -7.262  2.709   4.825   1.00 91.47 1   D 1 
-    #HETATM 2640 MG  MG    . MG  E 5 .   ? -4.994  2.251   8.755   1.00 85.96 1   E 1 
+    #HETATM 2639 MG  MG    . MG  D 4 .   ? -7.262  2.709   4.825   1.00 91.47 1   D 1
+    #HETATM 2640 MG  MG    . MG  E 5 .   ? -4.994  2.251   8.755   1.00 85.96 1   E 1
 
 
     # Boltz1 mmcif files (in non-standard order))
@@ -211,7 +211,7 @@ def parse_cif_atom_line(line,fielddict):
     #HETATM 2665  O  O1B   . ATP  .    1    ?  C  -7.04640   8.36577    -7.14326   1  3  C  ATP  1  1
     #HETATM 2666  O  O2B   . ATP  .    1    ?  C  -5.79036   7.13926    -5.33995   1  3  C  ATP  1  1
 
-    
+
     linelist =        line.split()
     atom_num =        linelist[ fielddict['id'] ]
     atom_name =       linelist[ fielddict['label_atom_id'] ]
@@ -222,14 +222,28 @@ def parse_cif_atom_line(line,fielddict):
     y =               linelist[ fielddict['Cartn_y'] ]
     z =               linelist[ fielddict['Cartn_z'] ]
 
-    if residue_seq_num == ".": return None   # ligand atom
-
     # Convert string numbers to integers or floats as appropriate
     atom_num = int(atom_num)
-    residue_seq_num = int(residue_seq_num)
     x = float(x)
     y = float(y)
     z = float(z)
+
+    # Handle ligand atoms (no residue number)
+    if residue_seq_num == ".":
+        # Return ligand atom with special flag - use negative atom number as identifier
+        return {
+            'atom_num': atom_num,
+            'atom_name': atom_name,
+            'residue_name': residue_name,
+            'chain_id': chain_id,
+            'residue_seq_num': -atom_num,  # Use negative atom number for ligand atoms
+            'is_ligand': True,
+            'x': x,
+            'y': y,
+            'z': z
+        }
+
+    residue_seq_num = int(residue_seq_num)
 
     return {
         'atom_num': atom_num,
@@ -237,6 +251,7 @@ def parse_cif_atom_line(line,fielddict):
         'residue_name': residue_name,
         'chain_id': chain_id,
         'residue_seq_num': residue_seq_num,
+        'is_ligand': False,
         'x': x,
         'y': y,
         'z': z
@@ -290,7 +305,7 @@ def init_chainpairdict_set(chainlist):
 def classify_chains(chains, residue_types):
     nuc_residue_set = {"DA", "DC", "DT", "DG", "A", "C", "U", "G"}
     chain_types = {}
-    
+
     # Get unique chains and iterate over them
     unique_chains = np.unique(chains)
     for chain in unique_chains:
@@ -300,11 +315,130 @@ def classify_chains(chains, residue_types):
         chain_residues = residue_types[indices]
         # Count nucleic acid residues
         nuc_count = sum(residue in nuc_residue_set for residue in chain_residues)
-        
+
         # Determine if the chain is a nucleic acid or protein
         chain_types[chain] = 'nucleic_acid' if nuc_count > 0 else 'protein'
-    
+
     return chain_types
+
+
+def calculate_protein_ligand_metrics(residues, cb_residues, ligand_atoms, chains, pae_matrix,
+                                     protein_ligand_distances, protein_chains, pae_cutoff, dist_cutoff):
+    """Calculate interface metrics for protein-ligand complexes
+
+    Supports multi-chain proteins (e.g., heterodimers) binding to ligands.
+    All protein chains are pooled together as the "protein" entity.
+
+    Args:
+        residues: List of CA residue dictionaries
+        cb_residues: List of CB residue dictionaries
+        ligand_atoms: List of ligand heavy atom dictionaries
+        chains: Array of chain IDs for residues
+        pae_matrix: PAE matrix (protein_residues + ligand_atoms)
+        protein_ligand_distances: Distance matrix (n_protein_residues, n_ligand_atoms)
+        protein_chains: List of protein chain IDs (can be multiple for multi-chain proteins)
+        pae_cutoff: PAE cutoff in Angstroms
+        dist_cutoff: Distance cutoff in Angstroms
+
+    Returns:
+        Dictionary with calculated metrics
+    """
+    if len(ligand_atoms) == 0 or len(protein_chains) == 0:
+        return {}
+
+    numres = len(residues)
+    num_ligand_atoms = len(ligand_atoms)
+
+    # Protein residue mask - ALL protein chains together
+    protein_mask = np.isin(chains, protein_chains)
+    n_protein = np.sum(protein_mask)
+
+    # Ligand atoms are at indices [numres:numres+num_ligand_atoms] in PAE matrix
+    ligand_start_idx = numres
+    ligand_end_idx = numres + num_ligand_atoms
+
+    # Extract protein-ligand PAE submatrix
+    if pae_matrix.shape[0] < ligand_end_idx:
+        print(f"Warning: PAE matrix too small for ligand atoms: {pae_matrix.shape[0]} < {ligand_end_idx}")
+        return {}
+
+    # Get the protein residue indices (to index into PAE matrix)
+    protein_indices = np.where(protein_mask)[0]
+
+    # PAE from protein residues to ligand atoms
+    # Shape: (n_protein_residues, n_ligand_atoms)
+    protein_ligand_pae = pae_matrix[protein_indices, ligand_start_idx:ligand_end_idx]
+
+    # Find interface residues (protein residues with good PAE to any ligand atom)
+    interface_protein_residues = set()
+    for i, res_idx in enumerate(protein_indices):
+        if np.any(protein_ligand_pae[i] < pae_cutoff):
+            interface_protein_residues.add(res_idx)
+
+    n0_interface = len(interface_protein_residues)
+
+    if n0_interface == 0:
+        # No good interface
+        return {
+            'ipsae_d0res': 0.0,
+            'ipsae_d0chn': 0.0,
+            'ipsae_d0dom': 0.0,
+            'lis': 0.0,
+            'interface_residues_protein': [],
+            'n0_interface': 0
+        }
+
+    # Calculate d0 values
+    d0chn = calc_d0(float(n_protein + num_ligand_atoms), 'protein')
+    d0dom = calc_d0(float(n0_interface + num_ligand_atoms), 'protein')
+
+    # Calculate ipSAE variants
+    ipsae_d0chn_values = []
+    ipsae_d0dom_values = []
+    ipsae_d0res_values = []
+
+    for i, res_idx in enumerate(protein_indices):
+        pae_to_ligand = protein_ligand_pae[i]
+        valid_ligand_atoms = pae_to_ligand < pae_cutoff
+        n_valid = np.sum(valid_ligand_atoms)
+
+        if n_valid > 0:
+            # ipSAE_d0chn
+            ptm_values_chn = ptm_func_vec(pae_to_ligand[valid_ligand_atoms], d0chn)
+            ipsae_d0chn_values.append(np.mean(ptm_values_chn))
+
+            # ipSAE_d0dom
+            ptm_values_dom = ptm_func_vec(pae_to_ligand[valid_ligand_atoms], d0dom)
+            ipsae_d0dom_values.append(np.mean(ptm_values_dom))
+
+            # ipSAE_d0res (per-residue d0)
+            d0res = calc_d0(n_valid, 'protein')
+            ptm_values_res = ptm_func_vec(pae_to_ligand[valid_ligand_atoms], d0res)
+            ipsae_d0res_values.append(np.mean(ptm_values_res))
+
+    ipsae_d0res = float(np.max(ipsae_d0res_values)) if ipsae_d0res_values else 0.0
+    ipsae_d0chn = float(np.max(ipsae_d0chn_values)) if ipsae_d0chn_values else 0.0
+    ipsae_d0dom = float(np.max(ipsae_d0dom_values)) if ipsae_d0dom_values else 0.0
+
+    # Calculate LIS for protein-ligand
+    valid_pae = protein_ligand_pae[protein_ligand_pae <= 12]
+    if valid_pae.size > 0:
+        scores = (12 - valid_pae) / 12
+        lis_score = float(np.mean(scores))
+    else:
+        lis_score = 0.0
+
+    return {
+        'ipsae_d0res': ipsae_d0res,
+        'ipsae_d0chn': ipsae_d0chn,
+        'ipsae_d0dom': ipsae_d0dom,
+        'lis': lis_score,
+        'interface_residues_protein': list(interface_protein_residues),
+        'n0_interface': n0_interface,
+        'n0chn': n_protein + num_ligand_atoms,
+        'd0chn': d0chn,
+        'd0dom': d0dom
+    }
 
 
 # Load residues from AlphaFold PDB or mmCIF file into lists; each residue is a dictionary
@@ -312,13 +446,14 @@ def classify_chains(chains, residue_types):
 # Convert to np arrays, and calculate distances
 residues = []
 cb_residues = []
+ligand_atoms = []  # NEW: Store ligand atoms separately
 chains = []
 atomsitefield_num=0
 atomsitefield_dict={} # contains order of atom_site fields in mmCIF files; handles any mmCIF field order
 
 # For af3 and boltz1: need mask to identify CA atom tokens in plddt vector and pae matrix;
 # Skip ligand atom tokens and non-CA-atom tokens in PTMs (those not in residue_set)
-token_mask=list()     
+token_mask=list()
 residue_set= {"ALA", "ARG", "ASN", "ASP", "CYS",
               "GLN", "GLU", "GLY", "HIS", "ILE",
               "LEU", "LYS", "MET", "PHE", "PRO",
@@ -335,14 +470,29 @@ with open(pdb_path, 'r') as PDB:
             (atomsite,fieldname)=line.split(".")
             atomsitefield_dict[fieldname]=atomsitefield_num
             atomsitefield_num += 1
-            
+
         if line.startswith("ATOM") or line.startswith("HETATM"):
             if cif:
                 atom=parse_cif_atom_line(line, atomsitefield_dict)
             else:
                 atom=parse_pdb_atom_line(line)
-            if atom is None:  # ligand atom
+
+            if atom is None:  # parsing error
+                continue
+
+            # Handle ligand atoms (NEW)
+            if atom.get('is_ligand', False):
                 token_mask.append(0)
+                # Only keep heavy atoms (non-hydrogen) for ligands
+                if not atom['atom_name'].startswith('H'):
+                    ligand_atoms.append({
+                        'atom_num': atom['atom_num'] - 1,  # 0-indexed for consistency
+                        'coor': np.array([atom['x'], atom['y'], atom['z']]),
+                        'res': atom['residue_name'],
+                        'chainid': atom['chain_id'],
+                        'resnum': atom['residue_seq_num'],
+                        'residue': f"{atom['residue_name']:3}   {atom['chain_id']:3} LIG"
+                    })
                 continue
 
             if atom['atom_name'] == "CA" or "C1" in atom['atom_name']:
@@ -398,6 +548,18 @@ for chain1 in unique_chains:
 # Calculate distance matrix using NumPy broadcasting
 distances = np.sqrt(((coordinates[:, np.newaxis, :] - coordinates[np.newaxis, :, :])**2).sum(axis=2))
 
+# Calculate protein-ligand distances if ligands are present (NEW)
+protein_ligand_distances = None
+ligand_chains = set()
+if len(ligand_atoms) > 0:
+    ligand_coordinates = np.array([atom['coor'] for atom in ligand_atoms])
+    # Calculate CB-ligand distances: shape (n_residues, n_ligand_atoms)
+    diff = coordinates[:, np.newaxis, :] - ligand_coordinates[np.newaxis, :, :]
+    protein_ligand_distances = np.sqrt((diff ** 2).sum(axis=2))
+    # Track which chains have ligands
+    for atom in ligand_atoms:
+        ligand_chains.add(atom['chainid'])
+
 # Load AF2, AF3, or BOLTZ1 data and extract plddt and pae_matrix (and ptm_matrix if available)
 if af2:
     
@@ -425,7 +587,9 @@ if af2:
             pae_matrix = np.array(data['pae'])
         elif 'predicted_aligned_error' in data:
             pae_matrix=np.array(data['predicted_aligned_error'])
-            
+
+        pae_matrix_full = pae_matrix  # AF2 doesn't filter, so full matrix = pae_matrix
+
     else:
         print("AF2 PAE file does not exist: ", pae_file_path)
         sys.exit()
@@ -451,6 +615,7 @@ if boltz1:
     if os.path.exists(pae_file_path):
         data_pae = np.load(pae_file_path)
         pae_matrix_boltz1=np.array(data_pae['pae'])
+        pae_matrix_full = pae_matrix_boltz1  # Keep full matrix for protein-ligand analysis
         pae_matrix = pae_matrix_boltz1[np.ix_(token_array.astype(bool), token_array.astype(bool))]
 
     else:
@@ -505,6 +670,7 @@ if af3:
     
     # Set pae_matrix for AF3 from subset of full PAE matrix from json file
     token_array=np.array(token_mask)
+    pae_matrix_full = pae_matrix_af3  # Keep full matrix for protein-ligand analysis
     pae_matrix = pae_matrix_af3[np.ix_(token_array.astype(bool), token_array.astype(bool))]
     # Get iptm matrix from AF3 summary_confidences file
     iptm_af3=   {chain1: {chain2: 0     for chain2 in unique_chains if chain1 != chain2} for chain1 in unique_chains}
@@ -680,6 +846,70 @@ for chain1 in unique_chains:
             LIS[chain1][chain2]=0.0
 
 
+# ============================================================================
+# Handle protein-ligand complexes (NEW)
+# ============================================================================
+
+# Determine if this is a protein-ligand complex
+protein_chains = [ch for ch in unique_chains if chain_dict[ch] == 'protein']
+has_ligand = len(ligand_atoms) > 0
+is_protein_ligand_complex = has_ligand and len(protein_chains) >= 1
+
+if is_protein_ligand_complex:
+    print(f"\nDetected protein-ligand complex:")
+    print(f"  Protein chains: {protein_chains}")
+    print(f"  Ligand chains: {list(ligand_chains)}")
+    print(f"  Number of ligand heavy atoms: {len(ligand_atoms)}")
+    print(f"  PAE cutoff: {pae_cutoff} Å, Distance cutoff: {dist_cutoff} Å\n")
+
+    # Calculate protein-ligand metrics
+    pl_metrics = calculate_protein_ligand_metrics(
+        residues, cb_residues, ligand_atoms, chains, pae_matrix_full,
+        protein_ligand_distances, protein_chains, pae_cutoff, dist_cutoff
+    )
+
+    if pl_metrics:
+        print("Protein-Ligand Interface Metrics:")
+        print(f"  ipSAE (d0res):  {pl_metrics['ipsae_d0res']:.6f}")
+        print(f"  ipSAE (d0chn):  {pl_metrics['ipsae_d0chn']:.6f}")
+        print(f"  ipSAE (d0dom):  {pl_metrics['ipsae_d0dom']:.6f}")
+        print(f"  LIS:            {pl_metrics['lis']:.6f}")
+        print(f"  Interface size: {pl_metrics['n0_interface']} residues")
+        print(f"  n0chn:          {pl_metrics['n0chn']}")
+        print(f"  d0chn:          {pl_metrics['d0chn']:.3f} Å")
+        print(f"  d0dom:          {pl_metrics['d0dom']:.3f} Å\n")
+
+        # Write protein-ligand results to output file
+        OUT.write("\n# PROTEIN-LIGAND INTERFACE\n")
+        OUT.write(f"# Protein chains: {', '.join(protein_chains)}\n")
+        OUT.write(f"# Ligand chains: {', '.join(list(ligand_chains))}\n")
+        OUT.write(f"# Ligand heavy atoms: {len(ligand_atoms)}\n")
+        OUT.write(f"# PAE cutoff: {pae_cutoff} Å, Distance cutoff: {dist_cutoff} Å\n\n")
+        OUT.write("Protein Ligand  PAE Dist  ipSAE_d0res ipSAE_d0chn ipSAE_d0dom     LIS      n0_interface  n0chn  d0chn   d0dom  Model\n")
+        outstring = (
+            f"{'-'.join(protein_chains):7}  {'-'.join(list(ligand_chains)):6}  {pae_string:3}  {dist_string:3}  "
+            f"{pl_metrics['ipsae_d0res']:11.6f} {pl_metrics['ipsae_d0chn']:11.6f} {pl_metrics['ipsae_d0dom']:11.6f} "
+            f"{pl_metrics['lis']:9.6f}  {pl_metrics['n0_interface']:13d}  {pl_metrics['n0chn']:5d}  "
+            f"{pl_metrics['d0chn']:6.2f}  {pl_metrics['d0dom']:6.2f}  {pdb_stem}\n"
+        )
+        OUT.write(outstring)
+        OUT.write("\n")
+
+        # Write PyMOL script for protein-ligand interface
+        PML.write("\n# PROTEIN-LIGAND INTERFACE\n")
+        PML.write(f"# {outstring}")
+        interface_res_list = pl_metrics['interface_residues_protein']
+        if interface_res_list:
+            # Convert indices to residue numbers
+            interface_resnums = [residues[idx]['resnum'] for idx in interface_res_list if idx < len(residues)]
+            residue_string = contiguous_ranges(set(interface_resnums))
+            pml_alias_name = f"protein_ligand_interface"
+            pml_selection = f"chain {'+'.join(protein_chains)} and resi {residue_string}"
+            PML.write(f"alias {pml_alias_name}, color gray80, all; color orange, {pml_selection}; color marine, chain {'+'.join(list(ligand_chains))}\n\n")
+
+# ============================================================================
+# Calculate protein-protein ipTM/ipSAE (original functionality)
+# ============================================================================
 
 # calculate ipTM/ipSAE with and without PAE cutoff
 
